@@ -1,30 +1,38 @@
 """Ingest the SWEAT-DTG pelvis IMU export into a tidy, tagged dataset and
-detect the quiet-stance periods at the start/end of each trial.
+locate each trial's start/end within the recording.
 
 Each of the 149 sheets in ``SWEAT_DTG IMU Summary Data_ALL.xlsx`` holds one
 participant x condition trial (e.g. ``SWEAT_001DTG1``): a block of ``//``
 metadata lines followed by a header row (``PacketCounter, [SampleTimeFine,]
 Acc_X, Acc_Y, Acc_Z, Roll, Pitch, Yaw``) and ~100 Hz samples.
 
-There is no independent marker for gait start/end in the recording, only the
-participant standing still for calibration before and (sometimes) after the
-walk. This script finds that quiet stance automatically: it computes a
-rolling standard deviation of the acceleration-vector magnitude and looks for
-where it steps up from (roughly) sensor-noise level to walking level, and
-back down again — a mean + k*SD threshold ("2SD change") measured from a
-baseline window, per the study notes.
+There is no independent marker for gait start/end in the recording, and many
+sheets contain substantially more than the timed 3 m walk (extra idle time,
+repeated attempts) with no reliable quiet gap separating it from the real
+trial — so a pure quiet-stance/amplitude threshold (mean + k*SD on rolling
+Acc-magnitude SD, the "2SD change" rule) alone often grabs the wrong window
+(see `detect_quiet_periods` / the `bout_*` columns in the summary).
+
+Instead the primary method anchors on the mid-trial turn: the DTG protocol
+is a 3 m walk-with-turn, so the turn should sit at roughly the midpoint of
+the timed walk. The turn is a large, brief, easy-to-find spike in
+pseudo-angular-rate (`gyro_mag`, differentiated from the orientation
+channels since no raw gyro is exported); the trial window is then
+turn_time +/- logged_duration/2, with everything outside it discarded as
+excess (`detect_trial_window`). This falls back to the amplitude-bout window
+when a trial has no logged duration to anchor against.
 
 Outputs (under --outdir, default "output/"):
   - imu_samples_tagged.parquet   long-format, every sample from every trial,
                                   tagged with participant/condition and a
-                                  phase label (pre_quiet / active / post_quiet
-                                  / untagged_tail).
-  - trial_summary.csv            one row per trial: detected onset/offset,
-                                  detected duration, logged duration (joined
-                                  from the Trial Times spreadsheet), and QC
-                                  flags.
-  - diagnostic_plots/*.png       a handful of example trials with the
-                                  detection overlaid, for visual sanity-check.
+                                  phase label (excess_before / trial /
+                                  excess_after).
+  - trial_summary.csv            one row per trial: turn-anchored window,
+                                  the raw amplitude-bout window for
+                                  comparison, logged duration, and QC flags
+                                  (window_clipped, n_bouts, etc).
+  - diagnostic_plots/*.png       a handful of example trials with both
+                                  methods and the detected turn overlaid.
 
 Usage:
     python scripts/ingest_imu.py
@@ -124,6 +132,17 @@ class QuietDetectionResult:
     threshold: float
     n_bouts: int
     other_bouts: list  # Bout objects for any extra movement bouts, e.g. repeated reps
+    bouts: list  # every bout found (primary + other), for building an activity mask
+
+
+@dataclass
+class TrialWindowResult:
+    onset_idx: int
+    offset_idx: int
+    turn_idx: int | None
+    turn_peak_gyro_mag: float | None
+    method: str  # 'turn_anchored' | 'bout_fallback'
+    clipped: bool  # half-duration window ran off the start/end of the recording
 
 
 def _global_quiet_baseline(acc_sd: np.ndarray, low_percentile: float = 20.0) -> tuple[float, float]:
@@ -162,7 +181,6 @@ def detect_quiet_periods(
     roll_window_s: float = 0.25,
     merge_gap_s: float = 0.5,
     min_bout_s: float = 1.0,
-    logged_duration_s: float | None = None,
 ) -> QuietDetectionResult:
     """Segment the trial into quiet/active bouts from Acc magnitude, using a
     single threshold = baseline_mean + k*baseline_sd (the "2SD" rule) taken
@@ -173,9 +191,16 @@ def detect_quiet_periods(
     the real trial boundary.
 
     If more than one bout survives (e.g. a repeated attempt, per the study
-    notes' "repeated rep" case), the bout whose duration is closest to the
-    logged trial time is picked as the primary trial; the rest are kept as
-    `other_bouts` for QC rather than silently discarded.
+    notes' "repeated rep" case), the LONGEST bout is picked as primary — the
+    real trial (plus whatever extra idle/movement time the recording bundles
+    in with it) is reliably the single longest continuous non-quiet stretch,
+    whereas repeated-attempt reps and incidental blips are short. Picking by
+    closest-absolute-match to the logged duration instead was tried and
+    rejected: a short incidental blip can be numerically closer to the
+    logged duration than the real (but padded) trial bout, which then feeds
+    a wrong search window to detect_trial_window's turn search. The rest of
+    the bouts are kept as `other_bouts` for QC rather than silently
+    discarded.
     """
     n = len(df)
     roll_n = max(int(round(roll_window_s * fs)), 1)
@@ -193,12 +218,9 @@ def detect_quiet_periods(
     if not bouts:
         # no activity distinguishable from noise floor at all
         return QuietDetectionResult(0, n - 1, False, False, "end_of_recording",
-                                     baseline_mean, baseline_sd, threshold, 0, [])
+                                     baseline_mean, baseline_sd, threshold, 0, [], [])
 
-    if logged_duration_s is not None and not np.isnan(logged_duration_s) and len(bouts) > 1:
-        primary = min(bouts, key=lambda b: abs(b.duration_s - logged_duration_s))
-    else:
-        primary = max(bouts, key=lambda b: b.duration_s)
+    primary = max(bouts, key=lambda b: b.duration_s)
     other = [b for b in bouts if b is not primary]
 
     start_detected = primary.start_idx > 0
@@ -216,17 +238,85 @@ def detect_quiet_periods(
         threshold=threshold,
         n_bouts=len(bouts),
         other_bouts=other,
+        bouts=bouts,
     )
 
 
-def tag_phases(df: pd.DataFrame, result: QuietDetectionResult) -> pd.Series:
+def find_turn_idx(gyro_mag: np.ndarray, active_mask: np.ndarray | None) -> tuple[int, float]:
+    """Locate the mid-trial turn as the point of peak pseudo-angular-rate
+    magnitude. Restricted to samples inside a detected movement bout so an
+    idle stretch (or a completely unrelated blip) can't be mistaken for it —
+    the turn is a real, large, brief reorientation, and only makes sense
+    while the participant is already walking."""
+    if active_mask is not None and active_mask.any():
+        candidate = np.where(active_mask, gyro_mag, -np.inf)
+    else:
+        candidate = gyro_mag
+    idx = int(np.argmax(candidate))
+    return idx, float(gyro_mag[idx])
+
+
+def detect_trial_window(
+    df: pd.DataFrame,
+    fs: float,
+    bout_result: QuietDetectionResult,
+    logged_duration_s: float | None,
+) -> TrialWindowResult:
+    """Anchor the trial window on the mid-trial turn rather than on
+    quiet-period boundaries: the DTG protocol is a 3 m walk-with-turn, so the
+    turn should sit at roughly the midpoint of the timed trial. Recordings
+    often contain substantially more than the timed walk (extra idle time,
+    repeated attempts) with no reliable quiet gap separating it from the
+    real trial, which defeats amplitude-threshold segmentation alone —
+    but the turn itself is a distinctive, brief event that survives that
+    problem. Take turn_time +/- logged_duration/2 as the trial window and
+    treat everything outside it as excess data to discard.
+
+    Falls back to the amplitude-bout result when no logged duration is
+    available to anchor against.
+    """
     n = len(df)
-    phase = np.full(n, "active", dtype=object)
-    phase[: result.onset_idx] = "pre_quiet"
-    if result.offset_source == "detected":
-        phase[result.offset_idx + 1:] = "post_quiet"
-    for b in result.other_bouts:
-        phase[b.start_idx: b.end_idx + 1] = "active_other"
+    if logged_duration_s is None or np.isnan(logged_duration_s) or not bout_result.bouts:
+        return TrialWindowResult(bout_result.onset_idx, bout_result.offset_idx, None, None,
+                                  "bout_fallback", False)
+
+    # Restrict the turn search to the amplitude method's own best-matching
+    # bout (bout_result.onset_idx/offset_idx), not the union of every bout:
+    # a later, unrelated blip (equipment adjustment, repeated attempt) can
+    # have a larger pseudo-gyro spike than the real turn simply because
+    # Euler-angle differentiation amplifies unpredictably near gimbal lock,
+    # so searching every bout equally lets it hijack the turn estimate.
+    # Also trim a margin off each end of that bout: when the bout is padded
+    # with extra time, the largest spike right at its edge is usually the
+    # participant starting/stopping/removing the sensor, not the turn — a
+    # genuine mid-walk turn is, by definition, not at the very boundary of
+    # continuous movement.
+    bout_len = bout_result.offset_idx - bout_result.onset_idx + 1
+    margin_n = min(int(round(max(1.5, 0.1 * bout_len / fs) * fs)), bout_len // 2 - 1) if bout_len > 2 else 0
+    margin_n = max(margin_n, 0)
+    mask = np.zeros(n, dtype=bool)
+    mask[bout_result.onset_idx + margin_n: bout_result.offset_idx + 1 - margin_n] = True
+    turn_idx, turn_peak = find_turn_idx(df["gyro_mag"].to_numpy(), mask)
+
+    half_n = int(round(logged_duration_s / 2 * fs))
+    raw_onset = turn_idx - half_n
+    raw_offset = turn_idx + half_n
+    onset = max(raw_onset, 0)
+    offset = min(raw_offset, n - 1)
+    clipped = (onset != raw_onset) or (offset != raw_offset)
+
+    return TrialWindowResult(onset, offset, turn_idx, turn_peak, "turn_anchored", clipped)
+
+
+def tag_phases(df: pd.DataFrame, window: TrialWindowResult) -> pd.Series:
+    """Tag every sample relative to the trial window: 'trial' is what
+    downstream gait-metric code should use; 'excess_before'/'excess_after'
+    is everything discarded as outside the turn-anchored +/- half-duration
+    window (setup, repeated attempts, idle IMU, etc.)."""
+    n = len(df)
+    phase = np.full(n, "excess_before", dtype=object)
+    phase[window.onset_idx: window.offset_idx + 1] = "trial"
+    phase[window.offset_idx + 1:] = "excess_after"
     return pd.Series(phase, index=df.index, name="phase")
 
 
@@ -275,44 +365,48 @@ def process_all(source_xlsx: Path, trial_times_xlsx: Path, outdir: Path, k: floa
         logged_duration_s = float(logged["logged_duration_s"].iloc[0]) if len(logged) and pd.notna(logged["logged_duration_s"].iloc[0]) else np.nan
         notes = logged["Notes"].iloc[0] if len(logged) else None
 
-        result = detect_quiet_periods(df, fs, k=k, logged_duration_s=logged_duration_s)
-        df["phase"] = tag_phases(df, result)
+        bout_result = detect_quiet_periods(df, fs, k=k)
+        window = detect_trial_window(df, fs, bout_result, logged_duration_s)
+        df["phase"] = tag_phases(df, window)
         df.insert(0, "condition", condition)
         df.insert(0, "participant", participant)
         df.insert(0, "sheet", sheet_name)
         tagged_frames.append(df)
 
-        detected_duration_s = (result.offset_idx - result.onset_idx) / fs
+        detected_duration_s = (window.offset_idx - window.onset_idx) / fs
+        bout_duration_s = (bout_result.offset_idx - bout_result.onset_idx) / fs
         summary_rows.append({
             "sheet": sheet_name,
             "participant": participant,
             "condition": condition,
             "n_samples": len(df),
             "fs_hz": fs,
-            "onset_s": result.onset_idx / fs,
-            "offset_s": result.offset_idx / fs,
-            "detected_duration_s": detected_duration_s,
             "logged_duration_s": logged_duration_s,
+            "window_method": window.method,
+            "turn_time_s": window.turn_idx / fs if window.turn_idx is not None else np.nan,
+            "turn_peak_gyro_mag": window.turn_peak_gyro_mag,
+            "onset_s": window.onset_idx / fs,
+            "offset_s": window.offset_idx / fs,
+            "detected_duration_s": detected_duration_s,
             "duration_diff_s": detected_duration_s - logged_duration_s if pd.notna(logged_duration_s) else np.nan,
-            "start_detected": result.start_detected,
-            "end_detected": result.end_detected,
-            "offset_source": result.offset_source,
-            "n_bouts": result.n_bouts,
-            "n_other_bouts": len(result.other_bouts),
-            "baseline_mean": result.baseline_mean,
-            "baseline_sd": result.baseline_sd,
-            "threshold": result.threshold,
+            "window_clipped": window.clipped,
+            "bout_onset_s": bout_result.onset_idx / fs,
+            "bout_offset_s": bout_result.offset_idx / fs,
+            "bout_duration_s": bout_duration_s,
+            "bout_duration_diff_s": bout_duration_s - logged_duration_s if pd.notna(logged_duration_s) else np.nan,
+            "n_bouts": bout_result.n_bouts,
             "trial_notes": notes,
         })
 
         if plot_n and plotted < plot_n:
-            plot_trial(df, result, sheet_name, fs, plot_dir)
+            plot_trial(df, window, bout_result, sheet_name, fs, plot_dir)
             plotted += 1
 
-        flag = f" [+{len(result.other_bouts)} other bout(s)]" if result.other_bouts else ""
-        print(f"{sheet_name:22s} n={len(df):5d} onset={result.onset_idx/fs:5.2f}s "
-              f"offset={result.offset_idx/fs:5.2f}s ({result.offset_source}) "
-              f"detected_dur={detected_duration_s:5.2f}s logged={logged_duration_s}{flag}")
+        turn_time_s = window.turn_idx / fs if window.turn_idx is not None else float("nan")
+        print(f"{sheet_name:22s} n={len(df):5d} ({window.method}) onset={window.onset_idx/fs:5.2f}s "
+              f"offset={window.offset_idx/fs:5.2f}s turn={turn_time_s:5.2f}s "
+              f"dur={detected_duration_s:5.2f}s logged={logged_duration_s}"
+              f"{' [CLIPPED]' if window.clipped else ''}")
 
     tagged = pd.concat(tagged_frames, ignore_index=True)
     tagged.to_parquet(outdir / "imu_samples_tagged.parquet", index=False)
@@ -320,25 +414,26 @@ def process_all(source_xlsx: Path, trial_times_xlsx: Path, outdir: Path, k: floa
     summary = pd.DataFrame(summary_rows)
     summary.to_csv(outdir / "trial_summary.csv", index=False)
 
-    n_end_detected = summary["end_detected"].sum()
-    n_multi_bout = (summary["n_bouts"] > 1).sum()
+    n_turn_anchored = (summary["window_method"] == "turn_anchored").sum()
+    n_clipped = summary["window_clipped"].sum()
+    within_tol = (summary["duration_diff_s"].abs() <= 0.5).sum()
     print()
     print(f"Wrote {len(tagged):,} tagged samples across {len(summary)} trials to {outdir}")
-    print(f"Start quiet period detected in {summary['start_detected'].sum()}/{len(summary)} trials")
-    print(f"End quiet period detected in {n_end_detected}/{len(summary)} trials "
-          f"({100*n_end_detected/len(summary):.0f}%) — the rest run to end-of-recording "
-          f"while still active (offset_source='end_of_recording' in trial_summary.csv)")
-    print(f"{n_multi_bout} trials had more than one movement bout (repeated attempt / extra "
-          f"movement in the recording); the bout closest to the logged trial duration was "
-          f"picked as the primary trial, others tagged phase='active_other'")
+    print(f"Turn-anchored window used for {n_turn_anchored}/{len(summary)} trials "
+          f"({len(summary) - n_turn_anchored} fell back to the amplitude-bout window, no logged duration available)")
+    print(f"{n_clipped} trials had the turn so close to the recording edge that the "
+          f"+/-half-duration window had to be clipped — review these (window_clipped=True in trial_summary.csv)")
+    print(f"{within_tol}/{len(summary)} trials landed within 0.5s of the logged duration by construction; "
+          f"see bout_duration_diff_s for how far the raw amplitude-bout estimate was off before turn-anchoring")
 
 
-def plot_trial(df: pd.DataFrame, result: QuietDetectionResult, sheet_name: str, fs: float, plot_dir: Path) -> None:
+def plot_trial(df: pd.DataFrame, window: TrialWindowResult, bout_result: QuietDetectionResult,
+               sheet_name: str, fs: float, plot_dir: Path) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(2, 1, figsize=(11, 6), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
     t = df["t_s"].to_numpy()
     axes[0].plot(t, df["acc_mag"])
     axes[0].set_ylabel("|Acc| (m/s^2)")
@@ -347,19 +442,21 @@ def plot_trial(df: pd.DataFrame, result: QuietDetectionResult, sheet_name: str, 
     roll_n = max(int(round(0.25 * fs)), 1)
     axes[1].plot(t, rolling_std(df["acc_mag"].to_numpy(), roll_n))
     axes[1].set_ylabel("rolling SD |Acc|")
-    axes[1].set_xlabel("time (s)")
+
+    axes[2].plot(t, df["gyro_mag"], color="tab:purple")
+    axes[2].set_ylabel("pseudo-gyro mag (deg/s)")
+    axes[2].set_xlabel("time (s)")
 
     for ax in axes:
-        ax.axvline(result.onset_idx / fs, color="green", linestyle="--", label="onset")
-        color = "red" if result.offset_source == "detected" else "orange"
-        ax.axvline(result.offset_idx / fs, color=color, linestyle="--",
-                    label=f"offset ({result.offset_source})")
-        for b in result.other_bouts:
-            ax.axvspan(b.start_idx / fs, b.end_idx / fs, color="purple", alpha=0.15)
+        ax.axvline(window.onset_idx / fs, color="green", linestyle="--", label="turn-anchored onset")
+        ax.axvline(window.offset_idx / fs, color="green", linestyle="--", label="turn-anchored offset")
+        ax.axvline(bout_result.onset_idx / fs, color="orange", linestyle=":", label="amplitude-bout onset")
+        ax.axvline(bout_result.offset_idx / fs, color="orange", linestyle=":", label="amplitude-bout offset")
+        if window.turn_idx is not None:
+            ax.axvline(window.turn_idx / fs, color="red", linestyle="-", linewidth=1, label="turn")
         ax.grid(alpha=0.3)
-    axes[1].axhline(result.threshold, color="gray", linestyle=":", linewidth=1, label="threshold")
-    axes[0].legend(loc="upper right", fontsize=8)
-    axes[1].legend(loc="upper right", fontsize=8)
+    axes[1].axhline(bout_result.threshold, color="gray", linestyle=":", linewidth=1, label="amplitude threshold")
+    axes[0].legend(loc="upper right", fontsize=7)
     plt.tight_layout()
     plt.savefig(plot_dir / f"{sheet_name}.png", dpi=110)
     plt.close(fig)
