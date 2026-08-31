@@ -39,12 +39,12 @@ for picking the work back up.
 
 Parses all 149 sheets into a tidy, tagged dataset and locates each trial's
 start/end within the recording. Run via `python scripts/ingest_imu.py`;
-outputs go to `output/` (gitignored — regenerate from source, don't rely on
-committed copies):
+outputs go to `output/`:
 
 - `output/imu_samples_tagged.parquet` — every sample, tagged with
-  participant/condition/phase.
-- `output/trial_summary.csv` — per-trial detection results and QC flags.
+  participant/condition/phase (regenerate from source — gitignored, large).
+- `output/trial_summary.csv` — per-trial detection results and QC flags
+  (committed).
 
 ### Two onset/offset detection methods, and why neither alone was enough
 
@@ -137,23 +137,103 @@ event — a hybrid, not a single winner-take-all method.
   first 40s for review and both were re-judged against the cropped view
   (now included in the 149/149 figure above).
 
+## Gait metrics: `scripts/compute_gait_metrics.py`
+
+With trial boundaries settled by the review above, this computes walking
+speed and per-axis sway for 147 trials (the 2 confirmed-unusable trials
+excluded; run via `python scripts/compute_gait_metrics.py`).
+
+**Segmentation** — per trial, using the *reviewed* method choice for that
+specific trial (not a blanket rule, since review found this genuinely
+varies — see the hybrid finding above), and the turn location the reviewer
+corrected where applicable, else the auto-detected one:
+
+- `outbound` = `[start_event, turn − 2s]`
+- `turn`     = `[turn − 2s, turn + 2s]` — **excluded** from sway metrics
+- `return`   = `[turn + 2s, stop_event]`
+
+**Walking speed** = the protocol's known 3 m walked distance ÷ segment
+duration — not integrated from acceleration, which drifts within seconds
+on a single IMU with no zero-velocity updates (see the detection section
+above for the same reasoning).
+
+**Per-axis sway** (mean, SD, range) computed separately for each segment,
+on the raw sensor axes per the study's mounting convention: `Acc_X` =
+vertical, `Acc_Y` = lateral (M/L), `Acc_Z` = forward/backward (AP). Cross-
+checked against quiet-stance data: `Acc_Y` sits near zero at rest (no
+lateral tilt, as expected) while gravity splits between `Acc_X`/`Acc_Z`,
+consistent with the belt sitting at a slight forward/backward tilt rather
+than perfectly level — `Acc_X` still carries the majority of gravity, so
+the vertical/AP labels hold, they just aren't perfectly decoupled.
+
+### Output files (one row per trial in all three — none of it aggregated)
+
+- **`output/gait_metrics.csv`** — the primary output, in pipeline order.
+  Columns: `sheet`/`participant`/`condition`; `start_choice`/`stop_choice`
+  (which reviewed method was used); `turn_s` and the four segment
+  boundary times; `outbound_duration_s`/`return_duration_s`; `outbound_
+  speed_mps`/`return_speed_mps`; then per segment × per axis (`vertical`/
+  `lateral`/`ap`) × `mean`/`sd`/`range` (e.g. `outbound_vertical_sd`).
+- **`output/gait_metrics_by_participant.csv`** — identical rows, sorted by
+  participant then condition (`DTG_TRIAL`→`DTG1`→`DTG2`→`DTG3`), for
+  reading one person's 4 trials together.
+- **`output/gait_metrics_by_condition.csv`** — identical rows, sorted by
+  condition then participant, for reading one condition across everyone.
+
+### What the numbers show so far
+
+Averaging `outbound_speed_mps`/`return_speed_mps` and the three `_sd`
+columns per condition across all participants:
+
+| Condition | Speed out (m/s) | Speed back | Vertical SD out | Vertical SD back |
+|---|---|---|---|---|
+| DTG_TRIAL | 0.385 | 0.355 | 0.801 | 0.829 |
+| DTG1 | 0.415 | 0.399 | 0.913 | 0.885 |
+| DTG2 | 0.429 | 0.402 | 0.932 | 0.918 |
+| DTG3 | 0.454 | 0.430 | 0.984 | 1.013 |
+
+Two patterns worth noting before drawing conclusions:
+
+1. **Speed and sway rise together, monotonically, across all four repeated
+   trials** (`DTG_TRIAL`→`DTG3`). Since `DTG_TRIAL`→`DTG1` is same-day
+   practice, this looks more like a **practice/familiarity effect**
+   (walking faster, with more natural vertical oscillation, as the task
+   becomes routine) than fatigue-driven instability — a genuine
+   hydration/fatigue effect would be expected to decouple sway from speed,
+   not track it.
+2. **Outbound is consistently faster than return** in every condition —
+   matches earlier notes flagging outbound/return asymmetry as worth a
+   formal paired test rather than eyeballing the means.
+
+Per-participant walking speed varies about 2.5× between the slowest and
+fastest individuals, and tracks each person's own sway fairly closely
+(the fastest participant is also the swayest; the slowest is also the
+steadiest) — worth analyzing jointly rather than as independent outcomes.
+
 ## File map
 
 ```
-scripts/ingest_imu.py              Ingestion + both detection methods
-output/trial_summary.csv           Per-trial detection results (regenerate; gitignored)
-output/imu_samples_tagged.parquet  Tagged sample-level data (regenerate; gitignored)
-review/onset_review_labels.csv     Human review verdicts — the durable output of this phase
-requirements.txt                   Python dependencies
+scripts/ingest_imu.py                       Ingestion + both detection methods
+scripts/compute_gait_metrics.py             Walking speed + per-axis sway from reviewed trial windows
+output/trial_summary.csv                    Per-trial detection results
+output/gait_metrics.csv                     Per-trial speed + sway (147 rows, pipeline order)
+output/gait_metrics_by_participant.csv      Same rows, sorted by participant
+output/gait_metrics_by_condition.csv        Same rows, sorted by condition
+output/imu_samples_tagged.parquet           Tagged sample-level data (regenerate; gitignored — large)
+review/onset_review_labels.csv              Human review verdicts — the durable output of that phase
+requirements.txt                            Python dependencies
 ```
 
 ## Suggested next steps
 
-1. Implement the hybrid start=threshold / stop=turn-anchored window as the
-   production trial-boundary method in `ingest_imu.py`, using
-   `review/onset_review_labels.csv` as the validation set.
-2. Resolve or exclude the 2 remaining unclear trials.
-3. With trial windows finalized, move on to the actual gait/sway metrics
-   (trunk acceleration RMS, step cadence variability, turn duration,
-   outbound/return asymmetry — see the original analysis plan) and the
-   between-condition (baseline/post/post-24h) comparison.
+1. Formal statistical tests on `output/gait_metrics.csv`: a repeated-
+   measures trend test across the 4 conditions, and a paired outbound-vs-
+   return test, to confirm the patterns above rather than reading them off
+   the means.
+2. Decide whether the practice-effect trend needs a within-subject
+   correction (e.g. using `DTG_TRIAL` as each participant's own baseline)
+   before comparing `DTG1`/`DTG2`/`DTG3` for a hydration/fatigue effect.
+3. Consider the supplementary metrics noted earlier but not yet
+   implemented (step cadence/stride-time CV, step regularity via
+   autocorrelation, turn duration) if the axis-level sway metrics alone
+   don't separate the conditions cleanly.
